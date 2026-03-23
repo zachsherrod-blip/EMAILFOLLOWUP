@@ -1,12 +1,29 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 
+// ── Zod schema for the structured LLM response ─────────────────────────────
+
 const ClassificationResultSchema = z.object({
   shouldCreateTask: z.boolean(),
-  rationale: z.string(),
-  priorityScore: z.number().min(0).max(100),
-  shortPrompt: z.string().max(300), // Will be trimmed to 50 words
+  category: z.enum([
+    "Platform Partnership",
+    "Agency",
+    "Deal / Prospect",
+    "Customer",
+    "Other",
+  ]),
+  followUpOwed: z.boolean(),
+  isCallFollowUp: z.boolean(),
+  hasExplicitAsk: z.boolean(),
+  hasCommitment: z.boolean(),
+  revenueImpact: z.boolean(),
+  urgency: z.enum(["High", "Medium", "Low"]),
   company: z.string().nullable(),
+  rationale: z.string(),
+  shortPrompt: z.string(),
+  whatNeedsToHappen: z.string(),
+  whyItMatters: z.string(),
+  nextActions: z.tuple([z.string(), z.string()]),
 });
 
 export type ClassificationResult = z.infer<typeof ClassificationResultSchema>;
@@ -25,35 +42,57 @@ const client = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-const SYSTEM_PROMPT = `You are a follow-up task classifier for a personal productivity tool.
-Your job is to determine if a calendar meeting needs a follow-up email, and if so, generate a short AI prompt the user can paste into Superhuman AI to draft the email.
+const SYSTEM_PROMPT = `You are a Chief of Staff classifying outbound follow-up tasks for a Head of Growth.
 
-Rules:
-- Only recommend follow-up for external business meetings (not personal, not internal standups)
-- Be conservative — low false positives are better than many false positives
-- If the user already sent a follow-up, do NOT recommend creating a task
-- The shortPrompt must be 50 words or fewer, plain text, actionable, and specific
-- The shortPrompt should mention recipient names, meeting context, and the goal (warm follow-up, check-in, next steps, etc.)
-- Do not fabricate details or hallucinate next steps not evident from the context
+Your job: determine if a calendar meeting or email thread requires a follow-up, and return ONLY structured JSON — no explanation, no markdown, no preamble.
 
-Return valid JSON matching this exact schema:
+Hard rules:
+- External meetings only. Skip anything internal.
+- If the user already replied after the meeting, set shouldCreateTask: false.
+- shortPrompt must be ≤50 plain-text words, paste-ready for Superhuman AI.
+- whatNeedsToHappen: 1–2 lines describing the business outcome needed.
+- whyItMatters: 1 line on business consequence if this stalls.
+- nextActions: exactly 2 concrete action bullets.
+- Do NOT fabricate details not in the context.
+
+Return valid JSON matching this exact schema, no other text:
 {
   "shouldCreateTask": boolean,
-  "rationale": "one sentence explaining why",
-  "priorityScore": number between 0 and 100,
-  "shortPrompt": "the Superhuman AI prompt, max 50 words",
-  "company": "company name if inferable, or null"
+  "category": "Platform Partnership" | "Agency" | "Deal / Prospect" | "Customer" | "Other",
+  "followUpOwed": boolean,
+  "isCallFollowUp": boolean,
+  "hasExplicitAsk": boolean,
+  "hasCommitment": boolean,
+  "revenueImpact": boolean,
+  "urgency": "High" | "Medium" | "Low",
+  "company": string | null,
+  "rationale": "one sentence",
+  "shortPrompt": "≤50 word Superhuman AI prompt",
+  "whatNeedsToHappen": "1–2 lines describing required outcome",
+  "whyItMatters": "1 line on business consequence",
+  "nextActions": ["action 1", "action 2"]
 }
 
-Priority scoring guide:
-- 80-100: Revenue, partnership, customer, investor meetings with no follow-up
-- 55-79: Important business meetings, pending next steps
-- 30-54: Lower-stakes meetings, nice to follow up but not urgent
-- 0-29: Likely not worth a task`;
+Category guide:
+- Platform Partnership: tech partner, integration, co-sell, API partner, measurement vendor
+- Agency: media agency, buying group, holding company
+- Deal / Prospect: new logo, pipeline, proposal stage
+- Customer: existing paying account, renewal, expansion
+- Other: recruiter, advisor, conference, unclear
+
+Urgency guide:
+- High: call follow-up overdue, commitment made, explicit ask outstanding, revenue at risk
+- Medium: meeting happened, next steps discussed, 2–4 days ago
+- Low: intro meeting, general check-in, low stakes`;
 
 export async function classifyFollowUpTask(
   input: ClassifyInput
 ): Promise<ClassificationResult> {
+  // Deterministic pre-check: skip LLM entirely if already followed up
+  if (input.hasOutboundFollowUp) {
+    return noFollowUpNeeded("User already sent an outbound reply after this meeting.");
+  }
+
   const attendeeList = input.attendees
     .map((a) => (a.name ? `${a.name} <${a.email}>` : a.email))
     .join(", ");
@@ -67,57 +106,58 @@ export async function classifyFollowUpTask(
 Date: ${input.eventDate} (${input.daysSinceEvent} business day(s) ago)
 Attendees: ${attendeeList}
 Description: ${input.eventDescription || "(none)"}
-User already sent follow-up: ${input.hasOutboundFollowUp ? "YES — do not create task" : "NO"}${threadContext}
+User already replied: NO${threadContext}
 
-Classify this meeting and return JSON.`;
-
-  // Deterministic pre-check: if user already followed up, skip LLM call
-  if (input.hasOutboundFollowUp) {
-    return {
-      shouldCreateTask: false,
-      rationale: "User already sent an outbound email to the attendee(s) after this meeting.",
-      priorityScore: 0,
-      shortPrompt: "",
-      company: null,
-    };
-  }
+Return JSON only.`;
 
   try {
     const message = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 512,
+      max_tokens: 700,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: userMessage }],
     });
 
     const content = message.content[0];
-    if (content.type !== "text") {
-      throw new Error("Unexpected response type from LLM");
-    }
+    if (content.type !== "text") throw new Error("Unexpected LLM response type");
 
-    // Extract JSON from response (handle markdown code blocks)
+    // Strip markdown fences if present
     const jsonMatch = content.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error("No JSON found in LLM response");
-    }
+    if (!jsonMatch) throw new Error("No JSON in LLM response");
 
     const parsed = JSON.parse(jsonMatch[0]);
     const result = ClassificationResultSchema.parse(parsed);
 
     // Enforce 50-word limit on shortPrompt
-    if (result.shortPrompt) {
-      const words = result.shortPrompt.trim().split(/\s+/);
-      if (words.length > 50) {
-        result.shortPrompt = words.slice(0, 50).join(" ");
-      }
-    }
+    const words = result.shortPrompt.trim().split(/\s+/);
+    if (words.length > 50) result.shortPrompt = words.slice(0, 50).join(" ");
 
     return result;
   } catch (err) {
     console.error("LLM classification failed, using fallback:", err);
-    // Fallback: create a task with a generic prompt
     return fallbackClassification(input);
   }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function noFollowUpNeeded(rationale: string): ClassificationResult {
+  return {
+    shouldCreateTask: false,
+    category: "Other",
+    followUpOwed: false,
+    isCallFollowUp: false,
+    hasExplicitAsk: false,
+    hasCommitment: false,
+    revenueImpact: false,
+    urgency: "Low",
+    company: null,
+    rationale,
+    shortPrompt: "",
+    whatNeedsToHappen: "",
+    whyItMatters: "",
+    nextActions: ["", ""],
+  };
 }
 
 function fallbackClassification(input: ClassifyInput): ClassificationResult {
@@ -126,29 +166,32 @@ function fallbackClassification(input: ClassifyInput): ClassificationResult {
     .map((a) => a.name!)
     .slice(0, 2)
     .join(" and ");
-
   const recipient = names || input.attendees[0]?.email || "the attendees";
 
-  // Score based on recency and attendee count
-  let score = 60;
-  if (input.daysSinceEvent <= 1) score += 20;
-  else if (input.daysSinceEvent <= 3) score += 10;
-  else if (input.daysSinceEvent > 7) score -= 15;
+  const isRecent = input.daysSinceEvent <= 2;
+  const urgency: "High" | "Medium" | "Low" = isRecent ? "High" : input.daysSinceEvent <= 4 ? "Medium" : "Low";
 
-  if (input.attendees.length >= 3) score += 5;
-
-  score = Math.max(0, Math.min(100, score));
-
-  const shortPrompt = `Write a concise follow-up to ${recipient} after our ${input.eventTitle} meeting. Mention key discussion points, confirm next steps, and keep it professional and warm.`;
-
+  const shortPrompt = `Write a concise follow-up to ${recipient} after our ${input.eventTitle} meeting. Confirm next steps and keep it warm and professional.`;
   const words = shortPrompt.split(/\s+/);
-  const trimmed = words.length > 50 ? words.slice(0, 50).join(" ") : shortPrompt;
+  const trimmedPrompt = words.length > 50 ? words.slice(0, 50).join(" ") : shortPrompt;
 
   return {
     shouldCreateTask: true,
-    rationale: `External business meeting with ${recipient} occurred ${input.daysSinceEvent} day(s) ago with no outbound follow-up detected.`,
-    priorityScore: score,
-    shortPrompt: trimmed,
+    category: "Other",
+    followUpOwed: true,
+    isCallFollowUp: true,
+    hasExplicitAsk: false,
+    hasCommitment: false,
+    revenueImpact: false,
+    urgency,
     company: null,
+    rationale: `External meeting with ${recipient} occurred ${input.daysSinceEvent} day(s) ago with no outbound follow-up.`,
+    shortPrompt: trimmedPrompt,
+    whatNeedsToHappen: `Send follow-up to ${recipient} after the ${input.eventTitle} meeting.`,
+    whyItMatters: "Momentum stalls without a timely reply.",
+    nextActions: [
+      `Email ${recipient} to recap and confirm next steps`,
+      "Set a reminder if no reply within 3 days",
+    ],
   };
 }

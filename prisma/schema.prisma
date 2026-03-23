@@ -189,6 +189,7 @@ model FollowUpTask {
   surfacedCount   Int           @default(0)
   lastSurfacedAt  DateTime?
   dedupeKey       String        @unique
+  signalsJson     Json          @default("{}")
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
